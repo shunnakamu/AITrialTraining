@@ -1,37 +1,49 @@
+"""
+改良版がこちらにあるのでこちらを参照。
+https://github.com/tsubauaaa/AITrialTraining/blob/main/Training10/AITraining10-2.ipynb
+"""
+
 from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import librosa
+import numpy as np
+import keras
+import math
+
 
 from tqdm.notebook import tqdm
-
 from transformers import Wav2Vec2Processor, Wav2Vec2Model
 
 
-# https://huggingface.co/transformers/model_doc/wav2vec2.html#wav2vec2forctc
-# processorとmodelを使う場合、誤差逆伝播しようと思うと実装が難しそうなので、上記から修正したほうが良さそう
-
 class Wav2VecClassifier(nn.Module):
-    def __init__(self, hidden_size=512, num_classes=8, device='cuda', sr=16000):
+    def __init__(self, hidden_size=512, num_classes=8, device='cpu', sr=16000):
         super(Wav2VecClassifier, self).__init__()
+        self.hidden_size = hidden_size
         self.sr = sr
         self.device = device
         self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
         self.model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
-        self.lstm = nn.LSTM(768, hidden_size)
+        self.lstm = nn.LSTM(768, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x):
         input_values = self.processor(x, return_tensors="pt", sampling_rate=self.sr).input_values
-        # input_values = torch.squeeze(input_values)
-        input_values = torch.squeeze(input_values.permute(2, 1, 0)).to(self.device)
+        # (batch_size, seq_len)に次元入れ替え(batch first対応)
+        input_values = torch.squeeze(input_values.permute(1, 2, 0)).to(self.device)
         hidden_states = self.model(input_values).last_hidden_state
-        out, _ = self.lstm(hidden_states)
+
+        # pooling
+        # LSTMではなくシーケンス方向に平均にしてしまう (予定)
+
+        # lstm_out, lstm_hidden = self.lstm(hidden_states)
+        # lstm_hiddenの最後をhidden_sizeに平す
+        # out = self.fc(lstm_hidden[0].view(-1, self.hidden_size))
         out = F.relu(out)
-        out = self.fc(out)
-        return F.softmax(out)
+        out = F.softmax(out)
+        return out
 
 
 class AudioRawDataset(torch.utils.data.Dataset):
@@ -58,34 +70,29 @@ class AudioRawDataset(torch.utils.data.Dataset):
 
 
 class PadCollate:
-    """
-    a variant of callate_fn that pads according to the longest sequence in
-    a batch of sequences
-    """
-
-    def __init__(self, dim=1):
-        """
-        args:
-            dim - the dimension to be padded (dimension of time in sequences)
-        """
-        self.dim = dim
-
-    def pad_collate(self, batch):
-        '''
-        Padds batch of variable length
-
-        note: it converts things ToTensor manually here since the ToTensor transform
-        assume it takes in images rather than arbitrary tensors.
-        '''
-        ## get sequence lengths
-        lengths = torch.tensor([len(review_w2v) for review_w2v, star in batch])
-        ## padd
-        batch = [torch.Tensor(review_w2v) for review_w2v, star in batch]
-        batch = torch.nn.utils.rnn.pad_sequence(batch)
-        return batch, lengths
-
+    '''
+    Yields a batch from a list of Items
+    Args:
+    test : Set True when using with test data loader. Defaults to False
+    percentile : Trim sequences by this percentile
+    '''
+    def __init__(self,test=False,percentile=100):
+        self.test = test
+        self.percentile = percentile
     def __call__(self, batch):
-        return self.pad_collate(batch)
+        if not self.test:
+            data = [item[0] for item in batch]
+            target = [item[1] for item in batch]
+        else:
+            data = batch
+        lens = [len(x) for x in data]
+        max_len = np.percentile(lens, self.percentile)
+        data = keras.preprocessing.sequence.pad_sequences(data, maxlen=int(max_len))
+        data = torch.tensor(data, dtype=torch.float32)
+        if not self.test:
+            target = torch.tensor(target,dtype=torch.int64)
+            return [data,target]
+        return [data]
 
 
 if __name__ == '__main__':
